@@ -1,6 +1,6 @@
 # SafeStream - System Requirements & Environment Specifications
 
-This document outlines the hardware, software, dependencies, and environment configuration required to build and run the **SafeStream** project.
+This document outlines the hardware, software, dependencies, and environment configuration required to build, run, and export models for the **SafeStream** project.
 
 ---
 
@@ -10,10 +10,10 @@ This document outlines the hardware, software, dependencies, and environment con
 * **Processor (CPU)**: Octa-core ARM64-v8a architecture (Qualcomm Snapdragon, MediaTek Dimensity, Samsung Exynos, or Google Tensor).
 * **Graphics (GPU)**: Adreno / Mali / Xclipse GPU with **OpenCL 2.0+** support (required for TFLite GPU Delegate).
 * **RAM**: Minimum 4 GB (6 GB or higher recommended for continuous 30 FPS processing).
-* **Camera**: Front or rear camera with $1080p$ @ $30	ext{ FPS}$ capture capability.
+* **Camera**: Front or rear camera with 1080p @ 30 FPS capture capability.
 
 ---
-git add README.md REQUIREMENTS.md
+
 ## 💻 Development Workstation Requirements
 
 * **Operating System**: Windows 10/11 (64-bit), macOS 12+, or Ubuntu 22.04 LTS.
@@ -64,6 +64,20 @@ implementation("org.tensorflow:tensorflow-lite-support:0.4.4")
 ## 🤖 Neural Network Model Specs
 
 * **Architecture**: YOLOv8-Nano Face Detection
-* **Input Resolution**: $320 \times 320 \times 3$ (RGB)
+* **Input Resolution**: 320 x 320 x 3 (RGB)
 * **Precision Format**: Float32 / Quantized INT8
 * **Output Tensor Format**: `[1, 20, 2100]` / `[1, 2100, 20]` (Bounding boxes + Confidence scores)
+
+---
+
+## 🐍 Python Environment (Model Export & Conversion)
+
+* **Python Version**: 3.10 or newer
+* **Required Packages**:
+  ```bash
+  pip install ultralytics torch onnx
+  ```
+* **Export Execution**:
+  ```bash
+  python scripts/export.py
+  ```

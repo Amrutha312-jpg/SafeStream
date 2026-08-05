@@ -20,11 +20,12 @@ SafeStream is an Android application designed for high-performance, low-latency,
 
 | Component | Technology |
 | :--- | :--- |
-| **Language** | Kotlin, C++ |
+| **Language** | Kotlin, C++, Python |
 | **UI Framework** | Android Jetpack, XML Layouts |
 | **Camera Pipeline** | CameraX (`ImageAnalysis`, `Preview`) |
 | **AI / Machine Learning** | YOLOv8-Nano (TFLite / LiteRT), OpenCV Native C++ SDK |
 | **Hardware Acceleration** | OpenCL / TFLite GPU Delegate (FP16 precision) |
+| **Model Conversion** | Python, Ultralytics YOLOv8 API |
 | **Version Control** | Git / GitHub |
 
 ---
@@ -33,7 +34,7 @@ SafeStream is an Android application designed for high-performance, low-latency,
 
 ```text
 SafeStream/
-├── app/
+├── app/                  # Android application source code
 │   ├── src/
 │   │   ├── main/
 │   │   │   ├── java/com/safestream/app/
@@ -43,10 +44,15 @@ SafeStream/
 │   │   │   ├── assets/                     # YOLOv8 TFLite model assets (.tflite)
 │   │   │   └── res/                        # Layouts, graphics, and string resources
 │   │   └── build.gradle.kts                # App-level dependencies and build configuration
-├── sdk/                                    # OpenCV Native SDK dependencies
-├── build.gradle.kts                        # Top-level project build configuration
-├── settings.gradle.kts                     # Gradle settings & module references
-└── REQUIREMENTS.md                         # Setup, hardware, and environment dependencies
+├── scripts/              # Model training, export & conversion pipeline
+│   ├── export.py         # YOLOv8 to TFLite export script
+│   ├── yolov8n.pt        # PyTorch model weights
+│   └── yolov8n-face.tflite # Exported mobile TFLite model
+├── sdk/                  # OpenCV Native SDK dependencies
+├── build.gradle.kts      # Top-level project build configuration
+├── settings.gradle.kts   # Gradle settings & module references
+├── REQUIREMENTS.md       # Setup, hardware, and environment dependencies
+└── README.md             # Project overview documentation
 ```
 
 ---
@@ -58,6 +64,7 @@ SafeStream/
 * **Android SDK**: API 24 (Android 7.0) minimum, API 34/35 target.
 * **Physical Device**: Android device with ARM64 architecture and OpenCL/GPU support (Emulator will lack GPU delegate acceleration).
 * **JDK**: OpenJDK 17 or Java 21.
+* **Python Environment**: Python 3.10+ (for model export).
 
 ### 2. Installation & Setup
 1. Clone the repository:
@@ -74,11 +81,12 @@ SafeStream/
 
 ## ⚙️ How It Works (Pipeline)
 
-1. **Camera Frame Capture**: CameraX grabs frames from the camera sensor in YUV_420_888 / RGBA format.
-2. **Pre-Processing**: The image is cropped and resized to the model input dimensions ($320 \times 320$) and loaded into native `ByteBuffer`.
-3. **Edge AI Inference**: `YoloDetector` runs the frame through TFLite interpreter accelerated by GPU delegate to extract face detection candidate bounding boxes.
-4. **Post-Processing & Scaling**: Confidence filtering ($>0.10$) and Non-Maximum Suppression (NMS, $IoU > 0.45$) remove duplicate boxes, which are then re-mapped back to normalized display coordinates.
-5. **Blur Overlay Application**: Custom `BlurOverlayView` receives normalized bounding boxes and renders GPU-accelerated blur regions over the video preview.
+1. **Model Export**: Python script (`scripts/export.py`) converts PyTorch YOLOv8 weights into an optimized TFLite model targeting 320x320 input.
+2. **Camera Frame Capture**: CameraX grabs frames from the camera sensor in YUV_420_888 / RGBA format.
+3. **Pre-Processing**: The image is cropped and resized to model dimensions (320x320) and loaded into native `ByteBuffer`.
+4. **Edge AI Inference**: `YoloDetector` runs the frame through TFLite interpreter accelerated by GPU delegate to extract face detection candidate bounding boxes.
+5. **Post-Processing & Scaling**: Confidence filtering (>0.10) and Non-Maximum Suppression (NMS, IoU > 0.45) remove duplicate boxes, which are then re-mapped back to normalized display coordinates.
+6. **Blur Overlay Application**: Custom `BlurOverlayView` receives normalized bounding boxes and renders GPU-accelerated blur regions over the video preview.
 
 ---
 
