@@ -2,104 +2,120 @@
 
 **Real-Time Edge AI Middleware for Privacy-Preserving Live Video Anonymization**
 
-SafeStream is an Android application designed for high-performance, low-latency, privacy-preserving live video streaming. By processing video feeds locally on edge hardware, SafeStream automatically detects human faces in real time. It utilizes selective anonymization to seamlessly whitelist the primary streamer while dynamically blurring all unauthorized bystanders before streaming output, ensuring end-to-end privacy without relying on cloud computation.
+SafeStream is an on-device Android middleware that sits between the camera and the streaming encoder. It detects every face in the live camera feed, recognises the single enrolled streamer, and blurs all other faces **before any frame reaches the encoder or the network**. The streamer stays visible; bystanders do not.
 
 ---
 
 ## 🔑 Key Features
 
-* **Selective Streamer Whitelisting**: Registers the primary streamer using a continuous 5-second facial capture burst, storing multiple angles for robust recognition.
-* **Real-Time Face Anonymization**: Ultra-fast face detection using custom optimized YOLOv8-Nano models.
-* **Facial Embedding & Matching**: Utilizes the MobileFaceNet architecture to extract facial embeddings and computes Cosine Similarity (threshold: 0.48) to instantly distinguish the streamer from strangers.
-* **Temporal Debouncing & Smoothing**: Employs a frame-buffer memory system to prevent visual flickering and maintain stable unblurring even during brief lighting drops or extreme angles.
-* **On-Device Edge AI Processing**: Full execution on local hardware via **LiteRT (TensorFlow Lite)** with **GPU Acceleration** using `GpuDelegate` and FP16 precision.
-* **Custom Dynamic Blur Overlay**: Responsive box transformation and hardware-rendered blurring synchronized directly with camera frames.
-* **Persistent Local Storage**: Embeddings are safely serialized and stored on-device using Gson and SharedPreferences, ensuring the streamer remains recognized across app restarts.
+- **Selective anonymization**: keeps the enrolled streamer visible and redacts every other face.
+- **Fully on-device**: detection, identity matching, blurring and encoding all run on the phone. The enrolment gallery never leaves the device.
+- **Fail-safe by design**: if the streamer's identity cannot be confirmed, the face is blurred rather than exposed.
+- **Stable identity decision**: best-match exclusivity, EMA score smoothing and an IoU-gated hold-over (spatial **and** identity must agree) prevent flicker and bystander "hijacking".
+- **Bounded-cost redaction**: padded regions and a capped Gaussian kernel remove latency spikes from close-up faces.
+- **Live streaming**: H.264 video + AAC audio published over **RTMPS**, or recorded to a local MP4.
 
 ---
 
-## 🛠️ Tech Stack & Architecture
+## 🛠️ Tech Stack
 
 | Component | Technology |
-| :--- | :--- |
-| **Language** | Kotlin, C++, Python |
-| **UI Framework** | Android Jetpack, XML Layouts |
-| **Camera Pipeline** | CameraX (`ImageAnalysis`, `Preview`) |
-| **AI / Machine Learning** | YOLOv8-Nano (Face Detection), MobileFaceNet (Recognition) via TFLite |
-| **Hardware Acceleration** | OpenCL / TFLite GPU Delegate (FP16 precision) |
-| **Local Storage** | Android SharedPreferences, Google Gson |
-| **Version Control** | Git / GitHub |
+| --- | --- |
+| Language | Kotlin (app), C++ (OpenCV SDK), Python (model export) |
+| Camera | CameraX `ImageAnalysis`, 640×360, keep-only-latest |
+| Face detection | YOLOv8n-face, TFLite INT8, 320×320 input, GPU delegate with CPU fallback |
+| Identity | MobileFaceNet (192-d embeddings), cosine similarity |
+| Redaction | OpenCV Gaussian blur (CPU), 30% box padding, kernel 15–61, two passes |
+| Encoding / transport | RootEncoder: H.264 2.5 Mbit/s @ 20 fps, AAC 44.1 kHz, RTMPS or local MP4 |
+
+---
+
+## ⚙️ How It Works
+
+1. **Enrolment (once)**: the streamer rotates their head during a short timed window; face embeddings are stored on the device as the gallery.
+2. **Capture**: CameraX delivers frames; older frames are dropped rather than queued to keep latency bounded.
+3. **Detection**: YOLOv8n-face runs on a centre-square crop, **every 3rd frame**; boxes are cached on the frames in between.
+4. **Identity scoring**: each face is embedded with MobileFaceNet and scored by its best cosine similarity against the gallery.
+5. **Temporal decision**: only the best-scoring face can be the streamer (EMA-smoothed, α = 0.4, threshold 0.58). A hold-over of up to 5 detection frames requires IoU > 0.45 **and** smoothed score ≥ 0.42.
+6. **Redaction**: bystander boxes are padded and Gaussian-blurred; frames with no bystanders pass through without a copy.
+7. **Output**: the redacted bitmap is shown in the preview and is the **only** thing fed to the encoder, so an unprocessed frame cannot reach the network.
+
+---
+
+## 📊 Results
+
+Evaluated on two live multi-person sessions (up to 3 people in frame, 594 annotated face classifications) on a vivo V2222 under indoor lighting:
+
+| Metric | Value |
+| --- | --- |
+| Accuracy (streamer vs bystander) | 90.24% |
+| Precision / Recall (streamer class) | 92.88% / 90.81% |
+| F1-score | 91.83% |
+| Bystander redaction rate | 89.36% |
+| Mean processing time per frame | 74.1 ms (~13.5 fps throughput) |
+| Detection frame / cached-box frame | 152.9 ms / 34.6 ms |
+
+Bounding the blur kernel removed redaction spikes of 200–390 ms (capped at 68.8 ms in profiling).
+
+**Known limitations**
+
+- Streamer-to-bystander handoff is the main residual leak (68% of false positives).
+- Processing throughput (~13.5 fps) is below the encoder's 20 fps, which can trigger "insufficient video" warnings on some platforms.
+- No automatic RTMPS reconnection yet.
+- Evaluation covers two sessions, three participants, one device and indoor lighting only.
+- Gaussian blur is not provably irreversible.
 
 ---
 
 ## 📁 Repository Structure
 
-```text
-SafeStream/
-├── app/                  
-│   ├── src/
-│   │   ├── main/
-│   │   │   ├── java/com/safestream/app/
-│   │   │   │   ├── MainActivity.kt         # CameraX pipeline & frame analyzer
-│   │   │   │   ├── YoloDetector.kt         # YOLOv8 TFLite inference engine
-│   │   │   │   ├── FaceEmbedder.kt         # MobileFaceNet embedding generator
-│   │   │   │   ├── IdentityMatcher.kt      # Cosine similarity classification logic
-│   │   │   │   ├── EnrollmentHelper.kt     # 5-second enrollment burst manager
-│   │   │   │   ├── EnrollmentStore.kt      # Gson serialization for local storage
-│   │   │   │   ├── FaceCropUtils.kt        # Bitmap cropping and normalization
-│   │   │   │   └── BlurOverlayView.kt      # Real-time blur rendering view
-│   │   │   ├── assets/                     
-│   │   │   │   ├── yolov8n-face.tflite     # Face detection model
-│   │   │   │   └── mobilefacenet.tflite    # Face recognition model
-│   │   │   └── res/                        # Layouts, graphics, and string resources
-│   │   └── build.gradle.kts                # App-level dependencies
-├── scripts/              
-│   ├── export.py         # PyTorch to TFLite export script
-│   └── yolov8n.pt        # PyTorch model weights
-├── sdk/                  # OpenCV Native SDK dependencies
-├── build.gradle.kts      # Top-level project build configuration
-├── REQUIREMENTS.md       # Setup, hardware, and environment dependencies
-└── README.md             # Project overview documentation
 ```
+SafeStream/
+├── app/src/main/
+│   ├── java/com/safestream/app/
+│   │   ├── MainActivity.kt        # CameraX pipeline and UI
+│   │   ├── YoloDetector.kt        # TFLite face detection
+│   │   ├── FaceEmbedder.kt        # MobileFaceNet embeddings
+│   │   ├── IdentityMatcher.kt     # Streamer vs bystander decision
+│   │   ├── EnrollmentHelper.kt    # Streamer enrolment capture
+│   │   ├── EnrollmentStore.kt     # On-device enrolment gallery
+│   │   ├── BlurOverlayView.kt     # Preview overlay
+│   │   ├── LiveBitmapSource.kt    # Feeds redacted frames to the encoder
+│   │   └── StreamManager.kt       # RTMPS streaming / MP4 recording
+│   ├── assets/                    # TFLite models
+│   └── res/                       # Layouts and resources
+├── scripts/                       # Model export and conversion
+├── sdk/                           # OpenCV native SDK
+├── build.gradle.kts
+├── settings.gradle.kts
+├── REQUIREMENTS.md
+└── README.md
+```
+
 ---
 
 ## 🚀 Getting Started
 
-### 1. Prerequisites
-* **Android Studio**: Ladybug / Jellyfish (2024.1+) or newer.
-* **Android SDK**: API 24 (Android 7.0) minimum, API 34/35 target.
-* **Physical Device**: Android device with ARM64 architecture and OpenCL/GPU support (Emulator will lack GPU delegate acceleration).
-* **JDK**: OpenJDK 17 or Java 21.
-* **Python Environment**: Python 3.10+ (for model export).
+**Prerequisites**: Android Studio (2024.1+), Android SDK API 24+ (target 34/35), JDK 17 or 21, a physical ARM64 Android device (the emulator lacks GPU delegate support), Python 3.10+ (only for model export). See `REQUIREMENTS.md` for details.
 
-### 2. Installation & Setup
 1. Clone the repository:
-   ```bash
-   git clone [https://github.com/project14team/SafeStream.git](https://github.com/project14team/SafeStream.git)
+
+   ```
+   git clone https://github.com/project14team/SafeStream.git
    cd SafeStream
-2. Open the project in Android Studio.
-3. Allow Gradle to synchronize dependencies and build native libraries (`sdk/`).
-4. Connect a physical Android device via USB with **Developer Options** and **USB Debugging** enabled.
-5. Click **Run** (`Shift + F10`) to build and deploy the application.
+   ```
+
+2. Open the project in Android Studio and let Gradle sync.
+3. Connect a physical device with USB debugging enabled.
+4. Run the app, complete the one-time streamer enrolment, then start streaming or recording.
 
 ---
 
-## ⚙️ How It Works (Pipeline)
+## 👥 Team
 
-### Phase 1: Streamer Enrollment
-1. **Trigger Burst**: User taps "Register Face" to initiate a 5-second capture window.
-2. **Detection & Cropping**: YOLOv8 detects the face; `FaceCropUtils` extracts and normalizes the face to 112x112 pixels.
-3. **Embedding Generation**: MobileFaceNet converts the face crop into a multi-dimensional mathematical vector (`FloatArray`).
-4. **Persistent Storage**: Up to 30 diverse facial embeddings are serialized via Gson and saved to `SharedPreferences` for future sessions.
-
-### Phase 2: Live Anonymization
-1. **Camera Frame Capture**: CameraX grabs real-time frames in YUV_420_888 / RGBA format.
-2. **Edge AI Inference**: `YoloDetector` extracts bounding boxes for all faces currently in the frame.
-3. **Identity Classification**: Each detected face is cropped and embedded. `IdentityMatcher` compares these live embeddings against the stored streamer profile using Cosine Similarity.
-4. **Filtering & Debouncing**: Faces scoring below the threshold (`0.48`) are classified as bystanders. A temporal debouncing buffer prevents flickering.
-5. **Blur Overlay Application**: Custom `BlurOverlayView` receives the normalized bounding boxes of **only the bystanders** and renders GPU-accelerated blur regions over the video preview.
-
----
+Amrutha, Deeksha K P, Disha, Gagana M R
+Guide: Dr. Shwetha C. H., Department of CSE, MITE
 
 ## 📜 License
-This project is developed for academic and non-commercial research purposes under the Mangalore Institute of Technology & Engineering (MITE).
+
+Developed for academic and non-commercial research purposes at the Mangalore Institute of Technology & Engineering (MITE).
