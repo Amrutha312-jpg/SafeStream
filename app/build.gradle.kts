@@ -5,7 +5,7 @@ plugins {
 android {
     namespace = "com.safestream.app"
     compileSdk {
-        version = release(36) {
+        version = release(37) {
             minorApiLevel = 1
         }
     }
@@ -42,6 +42,7 @@ android {
 }
 
 dependencies {
+    implementation("com.github.pedroSG94.RootEncoder:library:2.8.0")
 
     // CameraX (To talk to the camera)
     val cameraxVersion = "1.3.4"

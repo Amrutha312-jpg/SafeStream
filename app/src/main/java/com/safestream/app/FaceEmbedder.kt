@@ -4,6 +4,8 @@ import android.content.Context
 import android.graphics.Bitmap
 import org.tensorflow.lite.DataType
 import org.tensorflow.lite.Interpreter
+import org.tensorflow.lite.gpu.CompatibilityList
+import org.tensorflow.lite.gpu.GpuDelegate
 import java.io.FileInputStream
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
@@ -14,17 +16,13 @@ import kotlin.math.sqrt
  * Loads a MobileFaceNet .tflite model and converts a cropped face Bitmap
  * into a normalized embedding vector.
  *
- * IMPORTANT — two things to verify before trusting this, same spirit as
- * YoloDetector.kt:
- *   1. Embedding dimension: this reads it dynamically from the model's
- *      output tensor shape, so it adapts automatically (128/192/256 are
- *      all common depending on which pretrained MobileFaceNet you use).
- *   2. Input normalization: this defaults to the common (pixel-127.5)/128.0
- *      scheme (range roughly -1..1). Some MobileFaceNet exports instead
- *      expect plain 0..1 (pixel/255.0). If verification/enrollment
- *      similarity scores look wrong (e.g. the same person scoring low
- *      against themselves), try switching NORMALIZE_TO_MINUS1_1 to false
- *      first — it's the most common culprit.
+ * CHANGED: now tries a GPU delegate first (same pattern as YoloDetector),
+ * falling back to 4-thread CPU only if the device doesn't support it. Log
+ * timing showed embed() costing ~40-60ms per call on CPU alone -- with two
+ * faces in frame that's 80-120ms just for embeddings, which was a large
+ * chunk of the live-streaming lag. GPU delegate should cut this
+ * meaningfully on devices that support it; on devices that don't, it
+ * silently falls back to the old CPU path so nothing breaks.
  */
 class FaceEmbedder(
     context: Context,
@@ -32,12 +30,22 @@ class FaceEmbedder(
     private val inputSize: Int = 112
 ) {
     private val interpreter: Interpreter
+    private var gpuDelegate: GpuDelegate? = null
     private val embeddingDim: Int
-    private val normalizeToMinus1_1 = true // see note above if results look wrong
+    private val normalizeToMinus1_1 = true // see note below if results look wrong
 
     init {
         val model = loadModelFile(context, modelPath)
-        val options = Interpreter.Options().apply { setNumThreads(4) }
+        val options = Interpreter.Options()
+
+        val compatList = CompatibilityList()
+        if (compatList.isDelegateSupportedOnThisDevice) {
+            gpuDelegate = GpuDelegate(compatList.bestOptionsForThisDevice)
+            options.addDelegate(gpuDelegate)
+        } else {
+            options.setNumThreads(4)
+        }
+
         interpreter = Interpreter(model, options)
         embeddingDim = interpreter.getOutputTensor(0).shape().last()
     }
@@ -78,6 +86,10 @@ class FaceEmbedder(
         val output = Array(1) { FloatArray(embeddingDim) }
         interpreter.run(inputBuffer, output)
 
+        if (scaled !== faceBitmap) {
+            scaled.recycle()
+        }
+
         return l2Normalize(output[0])
     }
 
@@ -93,9 +105,12 @@ class FaceEmbedder(
         fun cosineSimilarity(a: FloatArray, b: FloatArray): Float {
             var dot = 0f
             for (i in a.indices) dot += a[i] * b[i]
-            return dot // since both are unit vectors, dot product == cosine similarity
+            return dot
         }
     }
 
-    fun close() = interpreter.close()
+    fun close() {
+        interpreter.close()
+        gpuDelegate?.close()
+    }
 }

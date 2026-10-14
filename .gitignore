@@ -15,3 +15,7 @@
 
 # Google Services (if you add Firebase later)
 google-services.json
+build/
+.gradle/
+.idea/
+local.properties

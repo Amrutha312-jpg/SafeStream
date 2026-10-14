@@ -28,6 +28,42 @@
         android:text="Register My Face"
         android:textSize="16sp" />
 
+    <!-- Start/Stop Recording -->
+    <Button
+        android:id="@+id/btnRecord"
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:layout_gravity="top|center_horizontal"
+        android:layout_marginTop="32dp"
+        android:padding="12dp"
+        android:text="Start Recording"
+        android:textSize="16sp" />
+
+    <!-- Stage B: RTMPS stream URL input -->
+    <EditText
+        android:id="@+id/etStreamUrl"
+        android:layout_width="280dp"
+        android:layout_height="wrap_content"
+        android:layout_gravity="top|center_horizontal"
+        android:layout_marginTop="90dp"
+        android:hint="rtmps://a.rtmp.youtube.com/live2/KEY"
+        android:inputType="textUri"
+        android:textColorHint="#AAAAAA"
+        android:textColor="#FFFFFF"
+        android:background="#66000000"
+        android:padding="8dp" />
+
+    <!-- Stage B: Go Live button -->
+    <Button
+        android:id="@+id/btnGoLive"
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:layout_gravity="top|center_horizontal"
+        android:layout_marginTop="140dp"
+        android:padding="12dp"
+        android:text="Go Live"
+        android:textSize="16sp" />
+
     <!-- Switch Camera Button -->
     <ImageButton
         android:id="@+id/switchCameraButton"
