@@ -4,16 +4,14 @@ import android.content.Context
 
 /**
  * Persists the streamer's enrolled face embeddings locally (SharedPreferences).
- * UPDATED: now stores MULTIPLE samples per streamer (matching the "Capture
- * Multiple Samples" step from the enrollment design, and IdentityMatcher's
- * loadAll() usage) instead of a single overwritten embedding.
+ * Each logged-in account has its own separate storage, so one user's
+ * registered face is never used for another user.
  *
- * Nothing here ever leaves the device — consistent with the Zero-Cloud
- * Leakage principle from the rest of the project.
+ * Nothing here ever leaves the device (Zero-Cloud Leakage).
  */
 class EnrollmentStore(context: Context) {
 
-    private val prefs = context.getSharedPreferences("safestream_enrollment", Context.MODE_PRIVATE)
+    private val prefs = context.getSharedPreferences(storeNameFor(context), Context.MODE_PRIVATE)
 
     /** Adds one more sample without erasing previously stored ones. */
     fun addSample(embedding: FloatArray) {
@@ -22,25 +20,21 @@ class EnrollmentStore(context: Context) {
         prefs.edit().putString(KEY_EMBEDDINGS, existing.joinToString(SAMPLE_SEPARATOR)).apply()
     }
 
-    /** Replaces ALL stored samples with a single one. Kept for compatibility
-     * with any code still calling the old single-sample save(). */
+    /** Replaces ALL stored samples with a single one. */
     fun save(embedding: FloatArray) {
         prefs.edit().putString(KEY_EMBEDDINGS, serialize(embedding)).apply()
     }
 
-    /** Returns every stored embedding sample — this is what IdentityMatcher calls. */
+    /** Returns every stored embedding sample for the current account. */
     fun loadAll(): List<FloatArray> = loadAllRaw().mapNotNull { deserialize(it) }
 
-    /** Backward-compatible single-sample accessor: returns the first stored sample. */
     fun load(): FloatArray? = loadAll().firstOrNull()
 
     fun isEnrolled(): Boolean = loadAllRaw().isNotEmpty()
 
     fun sampleCount(): Int = loadAllRaw().size
 
-    /** Wipes all stored samples — call at the START of a fresh enrollment session
-     * so old samples from a previous person/session don't linger and get
-     * matched against. */
+    /** Wipes this account's samples. */
     fun clear() {
         prefs.edit().remove(KEY_EMBEDDINGS).apply()
     }
@@ -63,5 +57,13 @@ class EnrollmentStore(context: Context) {
     companion object {
         private const val KEY_EMBEDDINGS = "streamer_embeddings"
         private const val SAMPLE_SEPARATOR = ";"
+
+        /** Storage name unique to the logged-in account. */
+        private fun storeNameFor(context: Context): String {
+            val email = context.getSharedPreferences("SafeStreamSession", Context.MODE_PRIVATE)
+                .getString("current_user", null) ?: "guest"
+            val safe = email.replace(Regex("[^a-z0-9]"), "_")
+            return "safestream_enrollment_${safe}_${email.hashCode().toString(16)}"
+        }
     }
 }

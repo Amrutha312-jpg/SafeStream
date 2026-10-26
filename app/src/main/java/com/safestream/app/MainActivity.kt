@@ -171,6 +171,15 @@ class MainActivity : AppCompatActivity() {
                 Toast.makeText(this, "Live stream stopped", Toast.LENGTH_SHORT).show()
             }
         }
+        findViewById<Button>(R.id.btnLogout)?.setOnClickListener {
+            getSharedPreferences("SafeStreamSession", MODE_PRIVATE)
+                .edit().remove("current_user").apply()
+            startActivity(
+                android.content.Intent(this, LoginActivity::class.java)
+                    .addFlags(android.content.Intent.FLAG_ACTIVITY_CLEAR_TOP)
+            )
+            finish()
+        }
 
         if (ContextCompat.checkSelfPermission(this, Manifest.permission.CAMERA)
             == PackageManager.PERMISSION_GRANTED
@@ -446,11 +455,11 @@ class MainActivity : AppCompatActivity() {
 
     override fun onDestroy() {
         super.onDestroy()
-        if (isRecording) streamManager.stopLocalRecording()
-        if (streamManager.isStreaming) streamManager.stopStream()
-        streamManager.release()
-        detector.close()
-        faceEmbedder.close()
+        try { if (isRecording) streamManager.stopLocalRecording() } catch (e: Exception) { Log.w("MainActivity", "stop rec", e) }
+        try { if (streamManager.isStreaming) streamManager.stopStream() } catch (e: Exception) { Log.w("MainActivity", "stop stream", e) }
+        try { streamManager.release() } catch (e: Exception) { Log.w("MainActivity", "release", e) }
+        try { detector.close() } catch (e: Exception) { Log.w("MainActivity", "detector", e) }
+        try { faceEmbedder.close() } catch (e: Exception) { Log.w("MainActivity", "embedder", e) }
         cameraExecutor.shutdown()
     }
 }
