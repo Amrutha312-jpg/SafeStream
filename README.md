@@ -95,9 +95,13 @@ SafeStream/
 │   ├── assets/                    # TFLite models
 │   └── res/                       # Layouts (login, signup, camera) and resources
 ├── scripts/                       # Model export and conversion
-├── sdk/                           # OpenCV native SDK
+├── sdk/                           # OpenCV Android SDK (Gradle module :opencv)
+├── gradle/wrapper/                # Gradle wrapper (version config)
 ├── build.gradle.kts
 ├── settings.gradle.kts
+├── gradle.properties
+├── gradlew, gradlew.bat           # Gradle wrapper scripts
+├── .gitignore
 ├── REQUIREMENTS.md
 └── README.md
 ```
