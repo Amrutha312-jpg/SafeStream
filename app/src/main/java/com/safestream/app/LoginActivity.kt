@@ -17,14 +17,8 @@ class LoginActivity : AppCompatActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
 
-        // Already logged in? Go straight to the camera screen
-        val session = getSharedPreferences("SafeStreamSession", MODE_PRIVATE)
-        if (session.getString("current_user", null) != null) {
-            startActivity(Intent(this, MainActivity::class.java))
-            finish()
-            return
-        }
-
+        // Always show the login page when the app is opened.
+        // Do not automatically skip to MainActivity based on a saved session.
         setContentView(R.layout.activity_login)
 
         val email = findViewById<EditText>(R.id.etLoginEmail)
@@ -49,23 +43,23 @@ class LoginActivity : AppCompatActivity() {
             }
 
             val savedHash = prefs.getString("user_$emailText", null)
-
             if (savedHash == null) {
                 email.error = "Account not found. Please sign up first."
                 return@setOnClickListener
             }
 
-            // Compare hashes, never plain-text passwords
             if (savedHash != hashPassword(passwordText, emailText)) {
                 password.error = "Incorrect password"
                 return@setOnClickListener
             }
 
+            // Save the signed-in user only after successful credential validation.
+            getSharedPreferences("SafeStreamSession", MODE_PRIVATE)
+                .edit()
+                .putString("current_user", emailText)
+                .apply()
+
             Toast.makeText(this, "Login successful!", Toast.LENGTH_SHORT).show()
-
-            val sessionPrefs = getSharedPreferences("SafeStreamSession", MODE_PRIVATE)
-            sessionPrefs.edit().putString("current_user", emailText).apply()
-
             startActivity(Intent(this, MainActivity::class.java))
             finish()
         }
@@ -75,10 +69,12 @@ class LoginActivity : AppCompatActivity() {
         }
     }
 
-    // PBKDF2 hash. Must be identical to the one in SignupActivity.
+    // Must match the password-hashing function in SignupActivity.
     private fun hashPassword(password: String, salt: String): String {
         val spec = PBEKeySpec(password.toCharArray(), salt.toByteArray(), 10000, 256)
-        val key = SecretKeyFactory.getInstance("PBKDF2WithHmacSHA256").generateSecret(spec).encoded
+        val key = SecretKeyFactory.getInstance("PBKDF2WithHmacSHA256")
+            .generateSecret(spec)
+            .encoded
         return Base64.encodeToString(key, Base64.NO_WRAP)
     }
 }

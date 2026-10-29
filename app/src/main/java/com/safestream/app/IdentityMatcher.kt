@@ -1,3 +1,4 @@
+
 package com.safestream.app
 
 import android.graphics.Bitmap
@@ -15,142 +16,186 @@ data class IdentifiedDetection(
 class IdentityMatcher(
     private val faceEmbedder: FaceEmbedder,
     private val enrollmentStore: EnrollmentStore,
-    // Kept at 0.58 for a fresh/first-time match. Partial-face frames are
-    // handled separately below instead of by loosening this.
-    private var similarityThreshold: Float = 0.58f
+    private val similarityThreshold: Float = 0.58f
 ) {
+    // Load embeddings once instead of parsing stored samples for every frame.
+    private val enrolledEmbeddings: List<FloatArray> =
+        enrollmentStore.loadAll()
+
+    private val holdChecks = 10
     private var consecutiveStreamerFrames = 0
 
-    // Slightly lower than the previous 6 -- that value, combined with the OR
-    // rescue below, was holding "streamer" status alive for too long/too
-    // loosely. 5 still comfortably covers a short run of partial-face frames.
-    private val debounceThreshold = 5
-
     private var lastStreamerBox: RectF? = null
+    private var lastBestBox: RectF? = null
 
-    // FIXED BUG: a bystander standing close to the streamer could satisfy
-    // EITHER the spatial check OR the score check alone (they were combined
-    // with OR), so a friend who simply stepped near your last known box
-    // position could inherit "streamer" status even with a mediocre identity
-    // score, and briefly get left unblurred while you got blurred instead.
-    // Both signals now have to agree together (AND) that the currently-held
-    // rescue is still looking at the SAME real person: close to where the
-    // streamer was AND still scoring meaningfully like the streamer. Raised
-    // both thresholds back up from the too-permissive values that caused
-    // this.
     private val keepAliveThreshold = 0.42f
     private val iouRescueThreshold = 0.45f
-
-    // NEW: raw per-frame similarity is noisy (0.33-0.94 for the SAME person
-    // across the same short clip -- normal for a quantized on-device
-    // embedding model, worse at distance/angle where the face crop has
-    // fewer real pixels in it). Comparing a single frame's raw score
-    // straight against the thresholds meant one unlucky frame could flip
-    // the enrolled streamer to "bystander" and back a moment later.
-    // Smoothing the top candidate's score across frames absorbs that
-    // single-frame noise without meaningfully slowing down a real
-    // person-swap, since an actual bystander's score stays consistently
-    // low rather than just dipping once.
-    private var emaScore = 0f
-
-    // Weight given to the newest frame's score. Lower = smoother / more
-    // resistant to single-frame noise, but slower to react to an actual
-    // person swap.
+    private val trackIouThreshold = 0.30f
     private val emaAlpha = 0.4f
 
+    private var emaScore = 0f
+
+    @Synchronized
     fun classify(
         squareBitmap: Bitmap,
         detections: List<YoloDetector.Detection>
     ): List<IdentifiedDetection> {
-        val enrolledEmbeddings = enrollmentStore.loadAll()
 
-        if (enrolledEmbeddings.isEmpty() || detections.isEmpty()) {
-            return detections.map { IdentifiedDetection(it, isStreamer = false, similarity = 0f) }
-        }
-
-        // STEP 1: Score EVERY face in the frame first, before making any decisions
-        val scoredFaces = detections.map { det ->
-            val faceCrop = FaceCropUtils.cropNormalized(squareBitmap, det.box)
-            val maxSimilarity = if (faceCrop != null) {
-                val liveEmbedding = faceEmbedder.embed(faceCrop)
-                enrolledEmbeddings.maxOfOrNull { stored ->
-                    FaceEmbedder.cosineSimilarity(liveEmbedding, stored)
-                } ?: 0f
-            } else {
-                0f
+        // Fail closed: blur all detected faces if nobody is enrolled.
+        if (enrolledEmbeddings.isEmpty()) {
+            return detections.map {
+                IdentifiedDetection(it, false, 0f)
             }
-            Pair(det, maxSimilarity)
         }
 
-        // STEP 2: Find the single highest scoring face in this specific frame
-        val bestMatchInFrame = scoredFaces.maxByOrNull { it.second }
-        var streamerFoundThisFrame = false
+        // Age the hold window when no face is detected.
+        if (detections.isEmpty()) {
+            lastBestBox = null
 
-        // STEP 3: Smooth the best candidate's score across frames, then
-        // classify based on who is the absolute best match.
-        val bestScore = bestMatchInFrame?.second ?: 0f
-        emaScore = if (emaScore == 0f) bestScore else emaAlpha * bestScore + (1 - emaAlpha) * emaScore
+            if (consecutiveStreamerFrames > 0) {
+                consecutiveStreamerFrames--
+            }
 
-        val results = scoredFaces.map { (det, score) ->
-            val isAbsoluteBest = (det == bestMatchInFrame?.first)
-            // Only the current best candidate's decision uses the smoothed
-            // score -- everyone else is evaluated on their own raw score,
-            // but they can never be classified as the streamer anyway since
-            // isAbsoluteBest is false for them.
-            val effectiveScore = if (isAbsoluteBest) emaScore else score
-            val rawMatch = isAbsoluteBest && effectiveScore >= similarityThreshold
+            if (consecutiveStreamerFrames == 0) {
+                lastStreamerBox = null
+                emaScore = 0f
+            }
 
-            var smoothedMatch = false
+            return emptyList()
+        }
 
-            if (rawMatch) {
-                // Genuine, confident match: full reset of the hold window.
-                consecutiveStreamerFrames = debounceThreshold
-                lastStreamerBox = det.box
-                smoothedMatch = true
-                streamerFoundThisFrame = true
-            } else if (consecutiveStreamerFrames > 0 && lastStreamerBox != null) {
-                // We recently confirmed this is the streamer. To keep that
-                // status for one more frame, this face now needs to be BOTH
-                // spatially close to where the streamer just was AND still
-                // scoring like the streamer -- not either one alone. This is
-                // what stops a nearby bystander from hijacking the rescue.
-                val iou = calculateIoU(det.box, lastStreamerBox!!)
-                val spatiallyClose = iou > iouRescueThreshold
-                val stillLooksLikeThem = isAbsoluteBest && effectiveScore >= keepAliveThreshold
+        val scored = detections.map { detection ->
+            detection to scoreFace(squareBitmap, detection)
+        }
 
-                if (spatiallyClose && stillLooksLikeThem) {
-                    lastStreamerBox = det.box
-                    smoothedMatch = true
-                    streamerFoundThisFrame = true
-                    Log.d(
-                        "SafeStream_Match",
-                        "Rescue used (iou=${"%.2f".format(iou)}, score=${"%.2f".format(score)})"
-                    )
+        val best = scored.maxByOrNull { it.second } ?: return emptyList()
+        val bestDetection = best.first
+        val bestScore = best.second
+
+        // Smooth scores only when the best face remains in the same track.
+        val previousBestBox = lastBestBox
+        val sameTrack = previousBestBox != null &&
+                calculateIoU(previousBestBox, bestDetection.box) >
+                trackIouThreshold
+
+        emaScore = if (sameTrack) {
+            emaAlpha * bestScore + (1f - emaAlpha) * emaScore
+        } else {
+            bestScore
+        }
+
+        lastBestBox = RectF(bestDetection.box)
+
+        var confirmedThisCall = false
+
+        val results = scored.map { (detection, score) ->
+            var isStreamer = false
+
+            if (detection === bestDetection) {
+                if (emaScore >= similarityThreshold) {
+                    // Confident match refreshes the hold window.
+                    isStreamer = true
+                    confirmedThisCall = true
+                    consecutiveStreamerFrames = holdChecks
+                    lastStreamerBox = RectF(detection.box)
+                } else {
+                    // Briefly preserve status only for a nearby,
+                    // reasonably similar face.
+                    val previousStreamerBox = lastStreamerBox
+
+                    if (
+                        consecutiveStreamerFrames > 0 &&
+                        previousStreamerBox != null
+                    ) {
+                        val iou = calculateIoU(
+                            detection.box,
+                            previousStreamerBox
+                        )
+
+                        if (
+                            iou > iouRescueThreshold &&
+                            emaScore >= keepAliveThreshold
+                        ) {
+                            isStreamer = true
+                            lastStreamerBox = RectF(detection.box)
+                        }
+                    }
                 }
             }
 
-            IdentifiedDetection(det, smoothedMatch, score)
+            IdentifiedDetection(detection, isStreamer, score)
         }
 
-        // STEP 4: Decrease debounce counter only if the streamer wasn't found at all in this frame
-        if (!streamerFoundThisFrame && consecutiveStreamerFrames > 0) {
+        // Rescue alone must not keep the hold window alive indefinitely.
+        if (!confirmedThisCall && consecutiveStreamerFrames > 0) {
             consecutiveStreamerFrames--
         }
+
+        if (consecutiveStreamerFrames == 0) {
+            lastStreamerBox = null
+        }
+
+        Log.d(
+            "SafeStream_Match",
+            "faces=${detections.size}, " +
+                    "best=${"%.2f".format(bestScore)}, " +
+                    "ema=${"%.2f".format(emaScore)}, " +
+                    "hold=$consecutiveStreamerFrames, " +
+                    "streamer=${results.any { it.isStreamer }}"
+        )
 
         return results
     }
 
-    private fun calculateIoU(box1: RectF, box2: RectF): Float {
-        val xA = max(box1.left, box2.left)
-        val yA = max(box1.top, box2.top)
-        val xB = min(box1.right, box2.right)
-        val yB = min(box1.bottom, box2.bottom)
+    private fun scoreFace(
+        squareBitmap: Bitmap,
+        detection: YoloDetector.Detection
+    ): Float {
+        val faceCrop = FaceCropUtils.cropNormalized(
+            squareBitmap,
+            detection.box
+        ) ?: return 0f
 
-        val intersectionArea = max(0f, xB - xA) * max(0f, yB - yA)
-        val box1Area = (box1.right - box1.left) * (box1.bottom - box1.top)
-        val box2Area = (box2.right - box2.left) * (box2.bottom - box2.top)
+        return try {
+            val liveEmbedding = faceEmbedder.embed(faceCrop)
 
-        val iou = intersectionArea / (box1Area + box2Area - intersectionArea)
-        return if (iou.isNaN()) 0f else iou
+            enrolledEmbeddings.maxOfOrNull { storedEmbedding ->
+                FaceEmbedder.cosineSimilarity(
+                    liveEmbedding,
+                    storedEmbedding
+                )
+            } ?: 0f
+        } catch (e: Exception) {
+            Log.e("SafeStream_Match", "Face scoring failed", e)
+            0f
+        } finally {
+            if (faceCrop !== squareBitmap && !faceCrop.isRecycled) {
+                faceCrop.recycle()
+            }
+        }
+    }
+
+    private fun calculateIoU(
+        box1: RectF,
+        box2: RectF
+    ): Float {
+        val left = max(box1.left, box2.left)
+        val top = max(box1.top, box2.top)
+        val right = min(box1.right, box2.right)
+        val bottom = min(box1.bottom, box2.bottom)
+
+        val intersectionWidth = max(0f, right - left)
+        val intersectionHeight = max(0f, bottom - top)
+        val intersectionArea = intersectionWidth * intersectionHeight
+
+        val area1 = max(0f, box1.width()) * max(0f, box1.height())
+        val area2 = max(0f, box2.width()) * max(0f, box2.height())
+        val unionArea = area1 + area2 - intersectionArea
+
+        return if (unionArea <= 0f) {
+            0f
+        } else {
+            intersectionArea / unionArea
+        }
     }
 }

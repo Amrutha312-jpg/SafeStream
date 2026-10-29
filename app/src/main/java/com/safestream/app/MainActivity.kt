@@ -3,9 +3,13 @@ package com.safestream.app
 import android.Manifest
 import android.content.pm.PackageManager
 import android.graphics.Bitmap
+import android.graphics.Canvas
+import android.graphics.Color
 import android.graphics.Matrix
+import android.graphics.Paint
 import android.graphics.RectF
 import android.os.Bundle
+import android.text.InputType
 import android.util.Log
 import android.util.Size
 import android.widget.Button
@@ -25,7 +29,7 @@ import org.opencv.android.OpenCVLoader
 import java.io.File
 import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
-
+import java.util.concurrent.atomic.AtomicBoolean
 class MainActivity : AppCompatActivity() {
 
     private lateinit var previewView: androidx.camera.view.PreviewView
@@ -36,17 +40,33 @@ class MainActivity : AppCompatActivity() {
 
     private lateinit var faceEmbedder: FaceEmbedder
     private lateinit var enrollmentStore: EnrollmentStore
-    private lateinit var identityMatcher: IdentityMatcher
+    @Volatile private lateinit var identityMatcher: IdentityMatcher
     private lateinit var enrollmentHelper: EnrollmentHelper
 
     // ---- Stage A: local recording ----
     private lateinit var streamManager: StreamManager
     @Volatile private var isRecording = false
     @Volatile private var pendingRecordingStart = false
+    private var currentRecordingFile: File? = null
 
     // ---- Stage B: live RTMPS ----
     @Volatile private var pendingStreamStart = false
     private var pendingStreamUrl: String = ""
+
+    // ---- Background detection (keeps the video path at a steady pace) ----
+    // Face detection + matching used to run inside the frame callback on every
+    // 3rd frame. Those frames took far longer than the others, which made the
+    // stream stutter. Now detection runs on its own thread and the frame path
+    // just applies the most recent blur boxes.
+    private val detectExecutor: ExecutorService = Executors.newSingleThreadExecutor()
+    private val detectBusy = AtomicBoolean(false)
+    @Volatile private var latestBoxes: List<RectF> = emptyList()
+    @Volatile private var detectionReady = false
+    @Volatile private var lastDetectionAtMs = 0L
+    // TFLite interpreters are not thread-safe; detector + embedder are shared
+    // between the enrollment path and the detection thread.
+    private val modelLock = Any()
+    private val scalePaint = Paint(Paint.FILTER_BITMAP_FLAG)
 
     private val connectChecker = object : ConnectChecker {
         override fun onConnectionStarted(url: String) {
@@ -115,6 +135,30 @@ class MainActivity : AppCompatActivity() {
 
         cameraExecutor = Executors.newSingleThreadExecutor()
 
+        // Stream URL box: no auto-capitalization / auto-correct, so the
+        // keyboard can't turn "rtmp://" into "Rtmp://".
+        findViewById<EditText>(R.id.etStreamUrl).apply {
+            inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_URI
+            setSingleLine(true)
+        }
+
+        Toast.makeText(this, "Welcome to SafeStream", Toast.LENGTH_SHORT).show()
+
+        // Logout button is optional: add a Button with android:id="@+id/btnLogout"
+        // to activity_main.xml to enable it. Looked up by name so the app still
+        // builds before you add the button.
+        val logoutId = resources.getIdentifier("btnLogout", "id", packageName)
+        if (logoutId != 0) {
+            findViewById<Button>(logoutId)?.setOnClickListener { logoutToLogin() }
+        }
+
+        if (!enrollmentStore.isEnrolled()) {
+            Toast.makeText(
+                this,
+                "Register your face first - until then every face, including yours, is blurred",
+                Toast.LENGTH_LONG
+            ).show()
+        }
         findViewById<ImageButton>(R.id.switchCameraButton).setOnClickListener {
             toggleCamera()
         }
@@ -125,19 +169,20 @@ class MainActivity : AppCompatActivity() {
                     runOnUiThread {
                         Toast.makeText(
                             this,
-                            "Slowly rotate head... $secondsLeft sec left",
+                            "Only you in view. Slowly turn your head... $secondsLeft sec left",
                             Toast.LENGTH_SHORT
                         ).show()
                     }
                 },
                 onComplete = {
                     identityMatcher = IdentityMatcher(faceEmbedder, enrollmentStore)
+                    val count = enrollmentHelper.samplesCaptured()
                     runOnUiThread {
-                        Toast.makeText(
-                            this,
-                            "Whitelisting Complete! Streamer Registered.",
-                            Toast.LENGTH_LONG
-                        ).show()
+                        val msg = if (count < MIN_ENROLL_SAMPLES)
+                            "Couldn't capture your face ($count samples). Keep only your face in view with good light and try again."
+                        else
+                            "Whitelisting complete! Streamer registered ($count samples)."
+                        Toast.makeText(this, msg, Toast.LENGTH_LONG).show()
                     }
                 }
             )
@@ -152,14 +197,42 @@ class MainActivity : AppCompatActivity() {
                 isRecording = false
                 (view as? Button)?.text = "Start Recording"
                 Toast.makeText(this, "Recording stopped", Toast.LENGTH_SHORT).show()
+                currentRecordingFile?.let { f ->
+                    MediaSaver.saveToGalleryAsync(this, f) { ok ->
+                        Toast.makeText(
+                            this,
+                            if (ok) "Saved to Gallery > Movies/SafeStream"
+                            else "Saved in app folder only: ${f.absolutePath}",
+                            Toast.LENGTH_LONG
+                        ).show()
+                    }
+                }
             }
         }
-
         findViewById<Button>(R.id.btnGoLive)?.setOnClickListener { view ->
             if (!streamManager.isStreaming) {
-                val url = findViewById<EditText>(R.id.etStreamUrl).text.toString().trim()
+                val url = normalizeStreamUrl(
+                    findViewById<EditText>(R.id.etStreamUrl).text.toString()
+                )
                 if (url.isEmpty()) {
-                    Toast.makeText(this, "Paste your RTMPS URL first", Toast.LENGTH_SHORT).show()
+                    Toast.makeText(this, "Paste your stream URL + key first", Toast.LENGTH_SHORT).show()
+                    return@setOnClickListener
+                }
+                if (!url.startsWith("rtmp://") && !url.startsWith("rtmps://")) {
+                    Toast.makeText(
+                        this,
+                        "URL must start with rtmp:// or rtmps:// (yours starts with: ${url.take(8)})",
+                        Toast.LENGTH_LONG
+                    ).show()
+                    return@setOnClickListener
+                }
+                // Common mistake: server address pasted without the stream key.
+                if (url.removePrefix("rtmps://").removePrefix("rtmp://").trimEnd('/').count { it == '/' } < 2) {
+                    Toast.makeText(
+                        this,
+                        "Add your stream key at the end: .../live2/YOUR-KEY",
+                        Toast.LENGTH_LONG
+                    ).show()
                     return@setOnClickListener
                 }
                 pendingStreamUrl = url
@@ -171,16 +244,6 @@ class MainActivity : AppCompatActivity() {
                 Toast.makeText(this, "Live stream stopped", Toast.LENGTH_SHORT).show()
             }
         }
-        findViewById<Button>(R.id.btnLogout)?.setOnClickListener {
-            getSharedPreferences("SafeStreamSession", MODE_PRIVATE)
-                .edit().remove("current_user").apply()
-            startActivity(
-                android.content.Intent(this, LoginActivity::class.java)
-                    .addFlags(android.content.Intent.FLAG_ACTIVITY_CLEAR_TOP)
-            )
-            finish()
-        }
-
         if (ContextCompat.checkSelfPermission(this, Manifest.permission.CAMERA)
             == PackageManager.PERMISSION_GRANTED
         ) {
@@ -192,12 +255,24 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
+    /** Removes spaces/line breaks/invisible characters and lowercases the scheme ("Rtmp://" -> "rtmp://"). The key part keeps its original case. */
+    private fun normalizeStreamUrl(raw: String): String {
+        val cleaned = raw.replace(Regex("\\s+"), "").replace("\u200B", "")
+        val idx = cleaned.indexOf("://")
+        return if (idx > 0) cleaned.substring(0, idx).lowercase() + cleaned.substring(idx) else cleaned
+    }
+
     private fun toggleCamera() {
         lensFacing = if (lensFacing == CameraSelector.LENS_FACING_BACK) {
             CameraSelector.LENS_FACING_FRONT
         } else {
             CameraSelector.LENS_FACING_BACK
         }
+        // Old boxes belong to the other camera's picture; don't send frames
+        // out until the new camera has been checked for faces.
+        detectionReady = false
+        lastDetectionAtMs = 0L
+        latestBoxes = emptyList()
         startCamera()
     }
 
@@ -216,7 +291,6 @@ class MainActivity : AppCompatActivity() {
                 .build().also {
                     it.setSurfaceProvider(previewView.surfaceProvider)
                 }
-
             val analysisResolutionSelector = ResolutionSelector.Builder()
                 .setAspectRatioStrategy(AspectRatioStrategy.RATIO_16_9_FALLBACK_AUTO_STRATEGY)
                 .setResolutionStrategy(
@@ -247,22 +321,54 @@ class MainActivity : AppCompatActivity() {
         }, ContextCompat.getMainExecutor(this))
     }
 
-    private var frameCount = 0
-    private var lastBoxes: List<RectF> = emptyList()
-    private var lastDetections: List<YoloDetector.Detection> = emptyList()
     private var dimsLogCounter = 0
-
-    // NEW -- timing diagnostics to find the real cause of the quality/lag
-    // complaint, instead of guessing again. Logs every ~15th frame so
-    // Logcat stays readable but samples come frequently enough during a
-    // short test. Filter Logcat by "SafeStream_Timing".
     private var timingLogCounter = 0
+    private var detectLogCounter = 0
 
-    private fun cropToSquare(bitmap: Bitmap): Bitmap {
-        val size = minOf(bitmap.width, bitmap.height)
-        val x = (bitmap.width - size) / 2
-        val y = (bitmap.height - size) / 2
-        return Bitmap.createBitmap(bitmap, x, y, size, size)
+    /**
+     * PRIVACY FIX: the old cropToSquare() kept only the CENTER square of the
+     * frame. In a portrait 360x640 frame that is a 360x360 band, so faces in
+     * the top and bottom ~22% of the picture were never detected and never
+     * blurred. Instead we now pad the whole frame into a square (black bars)
+     * so the detector sees everything. The normalized box coordinates map
+     * back to the frame with the same formula as before (see mapBoxToFrame).
+     * The square is also capped at DETECT_SIDE so a higher camera resolution
+     * later does not slow detection down.
+     */
+    private fun padToSquare(bitmap: Bitmap): Bitmap {
+        val srcSide = maxOf(bitmap.width, bitmap.height)
+        val scale = DETECT_SIDE.toFloat() / srcSide
+        val out = Bitmap.createBitmap(DETECT_SIDE, DETECT_SIDE, Bitmap.Config.ARGB_8888)
+        val canvas = Canvas(out)
+        canvas.drawColor(Color.BLACK)
+        val dw = bitmap.width * scale
+        val dh = bitmap.height * scale
+        val dst = RectF(
+            (DETECT_SIDE - dw) / 2f, (DETECT_SIDE - dh) / 2f,
+            (DETECT_SIDE + dw) / 2f, (DETECT_SIDE + dh) / 2f
+        )
+        canvas.drawBitmap(bitmap, null, dst, scalePaint)
+        return out
+    }
+    /** Square-normalized detector box -> frame-normalized blur box (+margin). */
+    private fun mapBoxToFrame(b: RectF, w: Float, h: Float): RectF {
+        val side = maxOf(w, h)
+        val ox = (w - side) / 2f
+        val oy = (h - side) / 2f
+        val l = (b.left * side + ox) / w
+        val t = (b.top * side + oy) / h
+        val r = (b.right * side + ox) / w
+        val bt = (b.bottom * side + oy) / h
+        // The box is up to a few frames old when applied, so grow it a bit
+        // to keep covering a face that has moved.
+        val padX = (r - l) * BLUR_MARGIN
+        val padY = (bt - t) * BLUR_MARGIN
+        return RectF(
+            (l - padX).coerceIn(0f, 1f),
+            (t - padY).coerceIn(0f, 1f),
+            (r + padX).coerceIn(0f, 1f),
+            (bt + padY).coerceIn(0f, 1f)
+        )
     }
 
     inner class FrameAnalyzer : ImageAnalysis.Analyzer {
@@ -287,7 +393,6 @@ class MainActivity : AppCompatActivity() {
                                 "rotation: ${imageProxy.imageInfo.rotationDegrees}"
                     )
                 }
-
                 if (pendingRecordingStart) {
                     pendingRecordingStart = false
                     val ready = if (streamManager.isPrepared) true
@@ -297,6 +402,7 @@ class MainActivity : AppCompatActivity() {
                             getExternalFilesDir(null),
                             "safestream_${System.currentTimeMillis()}.mp4"
                         )
+                        currentRecordingFile = outputFile
                         streamManager.startLocalRecording(outputFile.absolutePath) { status ->
                             Log.d("SafeStream_Record", "Status: $status")
                         }
@@ -316,7 +422,6 @@ class MainActivity : AppCompatActivity() {
                         }
                     }
                 }
-
                 if (pendingStreamStart) {
                     pendingStreamStart = false
                     val ready = if (streamManager.isPrepared) true
@@ -331,81 +436,80 @@ class MainActivity : AppCompatActivity() {
                     }
                 }
 
-                val width = fullBitmap.width.toFloat()
-                val height = fullBitmap.height.toFloat()
+                val w = fullBitmap.width.toFloat()
+                val h = fullBitmap.height.toFloat()
 
-                val size = minOf(width, height)
-                val leftOffset = (width - size) / 2f
-                val topOffset = (height - size) / 2f
-
-                val tCropStart = System.nanoTime()
-                val squareBitmap = cropToSquare(fullBitmap)
-                val tCropEnd = System.nanoTime()
-
+                // ---------------- Enrollment ----------------
                 if (enrollmentHelper.isEnrolling) {
-                    val enrollDetections = detector.detect(squareBitmap)
-                    for (det in enrollDetections) {
-                        val faceCrop = FaceCropUtils.cropNormalized(squareBitmap, det.box)
-                        if (faceCrop != null) {
-                            enrollmentHelper.processFrameForEnrollment(faceCrop)
-                            faceCrop.recycle()
+                    // Only run the detector when a sample is actually due.
+                    if (enrollmentHelper.readyForSample()) {
+                        val squareBitmap = padToSquare(fullBitmap)
+                        try {
+                            synchronized(modelLock) {
+                                // Largest face only, so a bystander is never whitelisted.
+                                val biggest = detector.detect(squareBitmap)
+                                    .maxByOrNull { it.box.width() * it.box.height() }
+                                if (biggest != null) {
+                                    val faceCrop = FaceCropUtils.cropNormalized(squareBitmap, biggest.box)
+                                    if (faceCrop != null) {
+                                        enrollmentHelper.processFrameForEnrollment(faceCrop)
+                                        if (faceCrop !== squareBitmap) faceCrop.recycle()
+                                    }
+                                }
+                            }
+                        } finally {
+                            squareBitmap.recycle()
                         }
                     }
-
-                    if (squareBitmap !== fullBitmap) squareBitmap.recycle()
-
-                    val rawProcessedBitmap = blurOverlay.applyBlurToBoxes(fullBitmap, emptyList())
-                    if (rawProcessedBitmap !== fullBitmap) fullBitmap.recycle()
-
-                    runOnUiThread {
-                        blurOverlay.setFrame(rawProcessedBitmap)
-                    }
+                    val shown = blurOverlay.applyBlurToBoxes(fullBitmap, emptyList())
+                    if (shown !== fullBitmap) fullBitmap.recycle()
+                    runOnUiThread { blurOverlay.setFrame(shown) }
                     return
                 }
 
-                // Timing markers -- populated only on frames that run
-                // detection (frameCount % 2 == 0); left at 0 on skipped
-                // frames, and the log line below reports "skip" for those.
-                var tDetectStart = 0L
-                var tDetectEnd = 0L
-                var tMatchStart = 0L
-                var tMatchEnd = 0L
-                var detectedCount = 0
+                // ---------------- Kick off detection in the background ----------------
+                // If the previous detection is still running, skip: the frame
+                // path never waits for it.
+                if (detectBusy.compareAndSet(false, true)) {
+                    val snapshot = padToSquare(fullBitmap)
+                    val matcher = identityMatcher
+                    detectExecutor.execute {
+                        val t0 = System.nanoTime()
+                        try {
+                            val toBlur: List<RectF> = synchronized(modelLock) {
+                                val detections = detector.detect(snapshot)
+                                matcher.classify(snapshot, detections)
+                                    .filter { !it.isStreamer }
+                                    .map { it.detection.box }
+                            }
+                            latestBoxes = toBlur.map { mapBoxToFrame(it, w, h) }
+                            lastDetectionAtMs = android.os.SystemClock.elapsedRealtime()
+                            detectionReady = true
 
-                val boxes: List<RectF>
-                if (frameCount % 3 == 0) {
-                    tDetectStart = System.nanoTime()
-                    val detections = detector.detect(squareBitmap)
-                    tDetectEnd = System.nanoTime()
-                    lastDetections = detections
-                    detectedCount = detections.size
-
-                    tMatchStart = System.nanoTime()
-                    val identified = identityMatcher.classify(squareBitmap, detections)
-                    tMatchEnd = System.nanoTime()
-
-                    Log.d("SafeStreamDebug", "Faces detected: ${identified.size}")
-                    identified.forEach { person ->
-                        Log.d("SafeStreamDebug", "Streamer Match: ${person.isStreamer} (Similarity: ${person.similarity})")
+                            detectLogCounter++
+                            if (detectLogCounter % 10 == 0) {
+                                Log.d(
+                                    "SafeStream_Timing",
+                                    "detect+match=${"%.1f".format((System.nanoTime() - t0) / 1_000_000.0)}ms " +
+                                            "blurBoxes=${toBlur.size}"
+                                )
+                            }
+                        } catch (e: Exception) {
+                            // Privacy-first fallback: if detection fails, blur the full frame
+                            // until a successful detection refreshes the face boxes.
+                            latestBoxes = listOf(RectF(0f, 0f, 1f, 1f))
+                            lastDetectionAtMs = android.os.SystemClock.elapsedRealtime()
+                            detectionReady = true
+                            Log.e("TEST", "Detection error: ${e.message}", e)
+                        } finally {
+                            snapshot.recycle()
+                            detectBusy.set(false)
+                        }
                     }
-
-                    val detectionsToBlur = identified.filter { !it.isStreamer }.map { it.detection }
-
-                    boxes = detectionsToBlur.map { det ->
-                        RectF(
-                            (det.box.left * size + leftOffset) / width,
-                            (det.box.top * size + topOffset) / height,
-                            (det.box.right * size + leftOffset) / width,
-                            (det.box.bottom * size + topOffset) / height
-                        )
-                    }
-                    lastBoxes = boxes
-                } else {
-                    boxes = lastBoxes
                 }
-                frameCount++
 
-                if (squareBitmap !== fullBitmap) squareBitmap.recycle()
+                // ---------------- Fast path: blur with the latest boxes ----------------
+                val boxes = latestBoxes
 
                 val tBlurStart = System.nanoTime()
                 val processedBitmap = blurOverlay.applyBlurToBoxes(fullBitmap, boxes)
@@ -414,15 +518,13 @@ class MainActivity : AppCompatActivity() {
                 if (processedBitmap !== fullBitmap) fullBitmap.recycle()
 
                 val tPushStart = System.nanoTime()
-                // Fixed vs. the version you're running: previously this only
-                // checked isRecording, so pushFrame() was never called
-                // during a live-only (no local recording) session -- no
-                // frames would have reached the RTMPS stream at all.
-                if (isRecording || streamManager.isStreaming) {
+                // Fail closed: nothing leaves the phone until the first face
+                // check has finished, otherwise the first fraction of a second
+                // would go out with no bystander blur at all.
+                if (detectionReady && (isRecording || streamManager.isStreaming)) {
                     streamManager.pushFrame(processedBitmap)
                 }
                 val tPushEnd = System.nanoTime()
-
                 runOnUiThread {
                     blurOverlay.setFrame(processedBitmap)
                 }
@@ -430,18 +532,13 @@ class MainActivity : AppCompatActivity() {
                 val tFrameEnd = System.nanoTime()
 
                 timingLogCounter++
-                if (timingLogCounter % 7 == 0) {
+                if (timingLogCounter % 15 == 0) {
                     fun ms(start: Long, end: Long) = "%.1f".format((end - start) / 1_000_000.0)
-                    val detectStr = if (tDetectEnd > 0) ms(tDetectStart, tDetectEnd) else "skip"
-                    val matchStr = if (tMatchEnd > 0) ms(tMatchStart, tMatchEnd) else "skip"
                     Log.d(
                         "SafeStream_Timing",
                         "TOTAL=${ms(tFrameStart, tFrameEnd)}ms | " +
                                 "convert=${ms(tConvertStart, tConvertEnd)} " +
-                                "crop=${ms(tCropStart, tCropEnd)} " +
-                                "detect=$detectStr (freshFaces=$detectedCount blurBoxes=${boxes.size}) " +
-                                "match=$matchStr " +
-                                "blur=${ms(tBlurStart, tBlurEnd)} " +
+                                "blur=${ms(tBlurStart, tBlurEnd)} (boxes=${boxes.size}) " +
                                 "push=${ms(tPushStart, tPushEnd)}"
                     )
                 }
@@ -453,14 +550,35 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
+    /** Return to login without deleting registered users or enrolled face data. */
+    private fun logoutToLogin() {
+        val intent = android.content.Intent(this, LoginActivity::class.java).apply {
+            flags = android.content.Intent.FLAG_ACTIVITY_NEW_TASK or
+                    android.content.Intent.FLAG_ACTIVITY_CLEAR_TASK
+        }
+        startActivity(intent)
+        finish()
+    }
+
     override fun onDestroy() {
         super.onDestroy()
-        try { if (isRecording) streamManager.stopLocalRecording() } catch (e: Exception) { Log.w("MainActivity", "stop rec", e) }
-        try { if (streamManager.isStreaming) streamManager.stopStream() } catch (e: Exception) { Log.w("MainActivity", "stop stream", e) }
-        try { streamManager.release() } catch (e: Exception) { Log.w("MainActivity", "release", e) }
-        try { detector.close() } catch (e: Exception) { Log.w("MainActivity", "detector", e) }
-        try { faceEmbedder.close() } catch (e: Exception) { Log.w("MainActivity", "embedder", e) }
+        enrollmentHelper.close()
+        if (isRecording) streamManager.stopLocalRecording()
+        if (streamManager.isStreaming) streamManager.stopStream()
+        streamManager.release()
         cameraExecutor.shutdown()
+        detectExecutor.shutdownNow()
+        synchronized(modelLock) {
+            detector.close()
+            faceEmbedder.close()
+        }
+    }
+
+    companion object {
+        private const val DETECT_SIDE = 640
+        private const val BLUR_MARGIN = 0.20f
+        private const val MAX_DETECTION_AGE_MS = 450L
+        private const val MIN_ENROLL_SAMPLES = 5
     }
 }
 
@@ -471,7 +589,6 @@ fun ImageProxy.toUprightBitmap(mirror: Boolean = false): Bitmap? {
         Log.e("MainActivity", "toBitmap failed", e)
         null
     } ?: return null
-
     val rotation = imageInfo.rotationDegrees.toFloat()
     val matrix = Matrix()
 
