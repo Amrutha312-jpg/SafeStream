@@ -30,6 +30,7 @@ import java.io.File
 import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
 import java.util.concurrent.atomic.AtomicBoolean
+
 class MainActivity : AppCompatActivity() {
 
     private lateinit var previewView: androidx.camera.view.PreviewView
@@ -159,6 +160,7 @@ class MainActivity : AppCompatActivity() {
                 Toast.LENGTH_LONG
             ).show()
         }
+
         findViewById<ImageButton>(R.id.switchCameraButton).setOnClickListener {
             toggleCamera()
         }
@@ -209,6 +211,7 @@ class MainActivity : AppCompatActivity() {
                 }
             }
         }
+
         findViewById<Button>(R.id.btnGoLive)?.setOnClickListener { view ->
             if (!streamManager.isStreaming) {
                 val url = normalizeStreamUrl(
@@ -244,6 +247,7 @@ class MainActivity : AppCompatActivity() {
                 Toast.makeText(this, "Live stream stopped", Toast.LENGTH_SHORT).show()
             }
         }
+
         if (ContextCompat.checkSelfPermission(this, Manifest.permission.CAMERA)
             == PackageManager.PERMISSION_GRANTED
         ) {
@@ -291,6 +295,7 @@ class MainActivity : AppCompatActivity() {
                 .build().also {
                     it.setSurfaceProvider(previewView.surfaceProvider)
                 }
+
             val analysisResolutionSelector = ResolutionSelector.Builder()
                 .setAspectRatioStrategy(AspectRatioStrategy.RATIO_16_9_FALLBACK_AUTO_STRATEGY)
                 .setResolutionStrategy(
@@ -350,6 +355,7 @@ class MainActivity : AppCompatActivity() {
         canvas.drawBitmap(bitmap, null, dst, scalePaint)
         return out
     }
+
     /** Square-normalized detector box -> frame-normalized blur box (+margin). */
     private fun mapBoxToFrame(b: RectF, w: Float, h: Float): RectF {
         val side = maxOf(w, h)
@@ -393,6 +399,7 @@ class MainActivity : AppCompatActivity() {
                                 "rotation: ${imageProxy.imageInfo.rotationDegrees}"
                     )
                 }
+
                 if (pendingRecordingStart) {
                     pendingRecordingStart = false
                     val ready = if (streamManager.isPrepared) true
@@ -422,6 +429,7 @@ class MainActivity : AppCompatActivity() {
                         }
                     }
                 }
+
                 if (pendingStreamStart) {
                     pendingStreamStart = false
                     val ready = if (streamManager.isPrepared) true
@@ -461,6 +469,7 @@ class MainActivity : AppCompatActivity() {
                             squareBitmap.recycle()
                         }
                     }
+
                     val shown = blurOverlay.applyBlurToBoxes(fullBitmap, emptyList())
                     if (shown !== fullBitmap) fullBitmap.recycle()
                     runOnUiThread { blurOverlay.setFrame(shown) }
@@ -508,8 +517,22 @@ class MainActivity : AppCompatActivity() {
                     }
                 }
 
-                // ---------------- Fast path: blur with the latest boxes ----------------
-                val boxes = latestBoxes
+                // ---------------- Privacy-first fast path ----------------
+                // Face boxes are normalized (0f..1f). Never reuse cached boxes
+                // after detection has become stale: a moving bystander could
+                // otherwise leave the old blur region while their face is clear.
+                val nowMs = android.os.SystemClock.elapsedRealtime()
+                val detectionAgeMs = nowMs - lastDetectionAtMs
+                val boxes: List<RectF> = if (
+                    !detectionReady ||
+                    lastDetectionAtMs == 0L ||
+                    detectionAgeMs > MAX_DETECTION_AGE_MS
+                ) {
+                    // Fail closed: blur the entire frame until detection refreshes.
+                    listOf(RectF(0f, 0f, 1f, 1f))
+                } else {
+                    latestBoxes
+                }
 
                 val tBlurStart = System.nanoTime()
                 val processedBitmap = blurOverlay.applyBlurToBoxes(fullBitmap, boxes)
@@ -525,6 +548,7 @@ class MainActivity : AppCompatActivity() {
                     streamManager.pushFrame(processedBitmap)
                 }
                 val tPushEnd = System.nanoTime()
+
                 runOnUiThread {
                     blurOverlay.setFrame(processedBitmap)
                 }
@@ -589,6 +613,7 @@ fun ImageProxy.toUprightBitmap(mirror: Boolean = false): Bitmap? {
         Log.e("MainActivity", "toBitmap failed", e)
         null
     } ?: return null
+
     val rotation = imageInfo.rotationDegrees.toFloat()
     val matrix = Matrix()
 
